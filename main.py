@@ -3,13 +3,13 @@ PhraseForge — Plagiarism Detector & Remover
 ============================================
 Models used  (~570 MB total, runs on CPU):
   • distilgpt2                          — plagiarism scoring via perplexity
-  • Vamsi/T5_Paraphrase_Paws           — paraphrasing (T5-small fine-tuned)
+  • Vamsi/T5_Paraphrase_Paws           — conservative paraphrasing (T5-small fine-tuned)
 
 Install deps:
   pip install "transformers==4.40.2" torch==2.2.2 fastapi uvicorn sentencepiece
 
 Run:
-  python app.py
+  python main.py
 
 Then open:  http://localhost:8000
 """
@@ -17,7 +17,9 @@ Then open:  http://localhost:8000
 import re
 import math
 import torch
+from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -34,6 +36,7 @@ app = FastAPI(title="PhraseForge", description="Plagiarism Detector & Remover")
 # ── Request schema ────────────────────────────────────────────────────────────
 class TextRequest(BaseModel):
     text: str
+    strength: Literal["balanced", "strong"] = "balanced"
 
 # ── Device ────────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -122,35 +125,48 @@ def risk_label(score: float) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def split_sentences(text: str):
-    """Return list of (kind, content) where kind ∈ {'TEXT','BLANK'}."""
+    """Return list of (kind, content) where kind is TEXT, BLANK or LINE_BREAK."""
     result = []
-    for para in text.split("\n"):
-        para = para.strip()
-        if not para:
+    lines = text.splitlines()
+
+    for line_no, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
             result.append(("BLANK", ""))
             continue
-        for sent in re.split(r"(?<=[.!?])\s+", para):
+
+        # Keep structural lines intact so headings, labels and list items do
+        # not get merged into neighboring paragraphs.
+        is_structural = bool(re.match(r"^(\s{0,4}(#{1,6}\s+|[-*•]\s+|\d+[.)]\s+)|.*:\s*$)", raw_line))
+        parts = [line] if is_structural else re.split(r"(?<=[.!?])\s+", line)
+
+        for sent in parts:
             sent = sent.strip()
             if sent:
                 result.append(("TEXT", sent))
+
+        if line_no < len(lines) - 1:
+            result.append(("LINE_BREAK", ""))
+
     return result
 
 
 def make_chunks(sentences, max_words: int = 150):
     """
     Group sentences into chunks with at most max_words words.
-    Paragraph breaks (BLANK) flush the current chunk.
+    Paragraph and line breaks flush the current chunk so output structure is
+    preserved.
     """
     chunks   = []
     buf      = []
     buf_len  = 0
 
     for kind, sent in sentences:
-        if kind == "BLANK":
+        if kind in {"BLANK", "LINE_BREAK"}:
             if buf:
                 chunks.append((" ".join(buf), "TEXT"))
                 buf, buf_len = [], 0
-            chunks.append(("", "BLANK"))
+            chunks.append(("", kind))
             continue
 
         wc = len(sent.split())
@@ -171,40 +187,117 @@ def make_chunks(sentences, max_words: int = 150):
 #  PARAPHRASING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def paraphrase_chunk(text: str, max_len: int = 256) -> str:
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text))
+
+
+def _protected_terms(text: str) -> set[str]:
     """
-    Paraphrase with sampling + high temperature, then a second pass
-    on the output to maximise divergence from the original.
+    Keep important domain terms visible. This prevents the paraphraser from
+    turning phrases such as "Nifty 50" or "Linear Regression" into nonsense.
     """
-    def _generate(src: str) -> str:
-        enc = para_tokenizer(
-            f"paraphrase: {src} </s>",
-            return_tensors="pt",
-            max_length=max_len,
-            truncation=True,
-            padding="max_length",
-        ).to(DEVICE)
-        with torch.no_grad():
-            out = para_model.generate(
-                input_ids            = enc["input_ids"],
-                attention_mask       = enc["attention_mask"],
-                max_length           = max_len,
-                do_sample            = True,
-                temperature          = 1.6,
-                top_k                = 120,
-                top_p                = 0.95,
-                repetition_penalty   = 3.5,
-                no_repeat_ngram_size = 4,
-                num_return_sequences = 1,
-            )
-        return para_tokenizer.decode(out[0], skip_special_tokens=True)
-
-    first_pass  = _generate(text)        # paraphrase original
-    second_pass = _generate(first_pass)  # paraphrase the paraphrase
-    return second_pass
+    phrases = re.findall(r"\b(?:[A-Z][A-Za-z0-9&-]*\s+){1,4}[A-Z0-9][A-Za-z0-9&-]*\b", text)
+    tickers = re.findall(r"\b[A-Z]{2,}\b|\b\d+(?:\.\d+)?%?\b", text)
+    return {term.strip().lower() for term in phrases + tickers if len(term.strip()) > 1}
 
 
-def paraphrase_text(text: str) -> str:
+def _quality_score(original: str, candidate: str, strength: str = "balanced") -> float:
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    if not candidate:
+        return -1.0
+
+    src_words = max(1, _word_count(original))
+    cand_words = _word_count(candidate)
+    length_ratio = cand_words / src_words
+    min_ratio, max_ratio = (0.50, 1.85) if strength == "strong" else (0.55, 1.65)
+    if length_ratio < min_ratio or length_ratio > max_ratio:
+        return -1.0
+
+    similarity = SequenceMatcher(
+        None,
+        original.lower(),
+        candidate.lower(),
+    ).ratio()
+
+    terms = _protected_terms(original)
+    if terms:
+        kept = sum(1 for term in terms if term in candidate.lower())
+        term_score = kept / len(terms)
+        if term_score < 0.5:
+            return -1.0
+    else:
+        term_score = 1.0
+
+    # Prefer faithful paraphrases. Strong mode targets lower surface similarity
+    # while still protecting structure, length and domain terms.
+    target_similarity = 0.56 if strength == "strong" else 0.72
+    similarity_score = 1.0 - abs(similarity - target_similarity)
+    length_score = 1.0 - abs(1.0 - length_ratio)
+    return (similarity_score * 0.55) + (length_score * 0.25) + (term_score * 0.20)
+
+
+def _generate_paraphrase_candidates(src: str, max_len: int, strength: str = "balanced") -> list[str]:
+    enc = para_tokenizer(
+        f"paraphrase: {src} </s>",
+        return_tensors="pt",
+        max_length=max_len,
+        truncation=True,
+        padding=True,
+    ).to(DEVICE)
+
+    generation_args = {
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"],
+        "max_length": max_len,
+        "repetition_penalty": 1.15,
+        "no_repeat_ngram_size": 3,
+        "early_stopping": True,
+    }
+    if strength == "strong":
+        generation_args.update({
+            "num_beams": 10,
+            "num_beam_groups": 5,
+            "num_return_sequences": 6,
+            "diversity_penalty": 0.8,
+            "repetition_penalty": 1.25,
+            "no_repeat_ngram_size": 2,
+        })
+    else:
+        generation_args.update({
+            "num_beams": 8,
+            "num_return_sequences": 4,
+        })
+
+    with torch.no_grad():
+        out = para_model.generate(**generation_args)
+    return [
+        para_tokenizer.decode(seq, skip_special_tokens=True).strip()
+        for seq in out
+    ]
+
+
+def paraphrase_chunk(text: str, max_len: int = 256, strength: str = "balanced") -> str:
+    """
+    Paraphrase once with beam search and choose the best faithful candidate.
+    If the model drifts or collapses the meaning, return the original chunk
+    instead of emitting unusable text.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    if _word_count(text) < 4:
+        return text
+
+    candidates = _generate_paraphrase_candidates(text, max_len=max_len, strength=strength)
+    ranked = sorted(
+        ((candidate, _quality_score(text, candidate, strength=strength)) for candidate in candidates),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    best, score = ranked[0]
+    min_score = 0.38 if strength == "strong" else 0.45
+    return best if score >= min_score else text
+
+
+def paraphrase_text(text: str, strength: str = "balanced") -> str:
     """
     Chunk → paraphrase in parallel (4 threads) → reassemble.
     Handles unlimited input length. ~4x faster than sequential on CPU.
@@ -214,12 +307,11 @@ def paraphrase_text(text: str) -> str:
 
     # Separate text chunks (need paraphrasing) from blank markers
     text_chunks    = [(i, c) for i, (c, k) in enumerate(chunks) if k == "TEXT"]
-    blank_positions = {i for i, (_, k) in enumerate(chunks) if k == "BLANK"}
 
     # Paraphrase all text chunks in parallel
     results = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(paraphrase_chunk, c): i for i, c in text_chunks}
+        futures = {executor.submit(paraphrase_chunk, c, 256, strength): i for i, c in text_chunks}
         for future in as_completed(futures):
             idx         = futures[future]
             results[idx] = future.result()
@@ -228,7 +320,9 @@ def paraphrase_text(text: str) -> str:
     final = ""
     for i, (_, kind) in enumerate(chunks):
         if kind == "BLANK":
-            final = final.rstrip() + "\n\n"
+            final = final.rstrip() + "\n"
+        elif kind == "LINE_BREAK":
+            final = final.rstrip() + "\n"
         else:
             final += results[i] + " "
 
@@ -272,12 +366,13 @@ async def paraphrase(body: TextRequest):
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
 
-    result   = paraphrase_text(text)
+    result   = paraphrase_text(text, strength=body.strength)
     ppl_new  = compute_perplexity(result)
     plag_new = perplexity_to_plagiarism(ppl_new)
 
     return {
         "paraphrased_text":      result,
+        "rewrite_strength":      body.strength,
         "new_plagiarism_score":  plag_new,
         "new_originality_score": round(100 - plag_new, 1),
         "new_risk_label":        risk_label(plag_new),
@@ -406,6 +501,12 @@ textarea::placeholder{color:var(--muted);opacity:.5}
 
 /* ── controls ── */
 .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.control-select{
+  height:38px;background:transparent;color:var(--text);border:1px solid var(--border2);
+  border-radius:var(--rsm);padding:0 34px 0 12px;font-family:'DM Sans',sans-serif;
+  font-size:13px;font-weight:600;outline:none;cursor:pointer;
+}
+.control-select option{background:var(--surface);color:var(--text)}
 
 .btn{
   padding:10px 22px;border-radius:var(--rsm);font-family:'DM Sans',sans-serif;
@@ -565,6 +666,10 @@ textarea::placeholder{color:var(--muted);opacity:.5}
     <button class="btn btn-secondary" id="btn-analyze" onclick="runAnalyze()">
       🔍 Analyse
     </button>
+    <select class="control-select" id="rewrite-strength" title="Rewrite strength">
+      <option value="balanced">Balanced rewrite</option>
+      <option value="strong">Stronger rewrite</option>
+    </select>
     <button class="btn btn-primary" id="btn-para" onclick="runParaphrase()">
       ✦ Remove Plagiarism
     </button>
@@ -628,6 +733,7 @@ function clearProgress() {
 function setBtns(disabled) {
   document.getElementById('btn-analyze').disabled = disabled;
   document.getElementById('btn-para').disabled    = disabled;
+  document.getElementById('rewrite-strength').disabled = disabled;
 }
 
 function animateBar(id, pct) {
@@ -698,6 +804,7 @@ async function runAnalyze() {
 
 async function runParaphrase() {
   const text = inp.value.trim();
+  const strength = document.getElementById('rewrite-strength').value;
   if (!text) { alert('Please enter some text first.'); return; }
 
   setBtns(true);
@@ -708,7 +815,7 @@ async function runParaphrase() {
   // Animated progress (fake, since T5 is synchronous on the server)
   let pct = 5;
   setProgress(pct);
-  setStatus('Paraphrasing text…', true);
+  setStatus(strength === 'strong' ? 'Applying stronger rewrite…' : 'Paraphrasing text…', true);
   const ticker = setInterval(() => {
     pct = Math.min(pct + (100 - pct) * 0.06, 90);
     setProgress(pct);
@@ -718,7 +825,7 @@ async function runParaphrase() {
     const res = await fetch('/paraphrase', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, strength }),
     });
     const d = await res.json();
     if (d.error) throw new Error(d.error);
@@ -795,4 +902,4 @@ function downloadOutput() {
 """
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

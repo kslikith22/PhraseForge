@@ -13,7 +13,7 @@ A fully local plagiarism detection and removal tool powered by Hugging Face Tran
 
 **Plagiarism scoring** uses GPT-2 perplexity — text that is highly predictable (low perplexity) matches patterns the model has memorised from common web text, indicating it may be copied. Higher perplexity means more original phrasing.
 
-**Paraphrasing** uses a T5-small model fine-tuned on paraphrase pairs. Text is split into 150-word chunks, each chunk is paraphrased in two passes for maximum divergence, and all chunks are processed in parallel (4 threads) for speed.
+**Paraphrasing** uses a T5-small model fine-tuned on paraphrase pairs. Text is split into 150-word chunks, each chunk is paraphrased once with beam search, and the app chooses the best faithful candidate using length, similarity and key-term preservation checks. The UI includes Balanced and Stronger rewrite modes.
 
 ---
 
@@ -40,7 +40,7 @@ conda activate plagiarism-remover
 pip install -r requirements.txt
 
 # 4. Run
-python app.py
+python main.py
 ```
 
 Then open **http://localhost:8000** in your browser.
@@ -51,7 +51,7 @@ Then open **http://localhost:8000** in your browser.
 
 1. Paste or type any amount of text into the input box (no length limit)
 2. Click **Analyse** to see the plagiarism score, originality score, word count and risk level
-3. Click **Remove Plagiarism** to paraphrase the text
+3. Choose **Balanced rewrite** or **Stronger rewrite**, then click **Remove Plagiarism** to paraphrase the text
 4. Copy or download the output
 
 ---
@@ -64,7 +64,7 @@ The app also exposes a REST API. Interactive docs available at **http://localhos
 Returns plagiarism score for the given text.
 ```json
 // Request
-{ "text": "Your text here..." }
+{ "text": "Your text here...", "strength": "balanced" }
 
 // Response
 {
@@ -87,6 +87,7 @@ Paraphrases the text and returns a new plagiarism score.
 // Response
 {
   "paraphrased_text": "...",
+  "rewrite_strength": "balanced",
   "new_plagiarism_score": 61.0,
   "new_originality_score": 39.0,
   "new_risk_label": "Medium Risk",
@@ -112,7 +113,7 @@ Times are for CPU (parallel, 4 threads). A GPU will be used automatically if ava
 
 ```
 phraseforge/
-├── app.py            # FastAPI server + embedded HTML frontend
+├── main.py           # FastAPI server + embedded HTML frontend
 ├── requirements.txt  # Python dependencies
 └── README.md
 ```
